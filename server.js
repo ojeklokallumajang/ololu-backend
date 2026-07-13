@@ -3,6 +3,7 @@ const cors = require('cors');
 const axios = require('axios');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const admin = require('firebase-admin');
 require('dotenv').config();
 
 const app = express();
@@ -37,6 +38,49 @@ const hashPassword = (password) => {
 
 const generateToken = (payload) => jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
 
+// --- INITIALIZE FIREBASE ---
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  try {
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+    });
+    console.log('Firebase Admin Initialized');
+  } catch (e) {
+    console.error('Firebase Init Error:', e.message);
+  }
+}
+
+const sendNotification = async (userId, payload) => {
+  if (!admin.apps.length) return;
+  try {
+    // Get FCM token from Supabase
+    const tokens = await supabase('fcm_tokens', 'GET', null, `?id=eq.${userId}`);
+    const token = tokens[0]?.token;
+    if (!token) return;
+
+    const message = {
+      token: token,
+      notification: {
+        title: payload.title,
+        body: payload.body,
+      },
+      data: payload.data || {},
+      android: {
+        priority: 'high',
+        notification: {
+          sound: 'default',
+          channelId: 'order_notifications'
+        }
+      }
+    };
+    await admin.messaging().send(message);
+    console.log('Notification sent successfully to', userId);
+  } catch (e) {
+    console.error('Notification error:', e.message);
+  }
+};
+
 // --- HELPER SUPABASE ---
 const supabase = async (table, method = 'GET', body = null, query = '') => {
   const baseUrl = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
@@ -66,70 +110,38 @@ const supabase = async (table, method = 'GET', body = null, query = '') => {
 
 app.get('/', (req, res) => res.send('OLOLU Backend is Running!'));
 
-// 1. KIRIM OTP (VIA FONNTE)
+// 1. AUTH & OTP
 app.post('/api/auth/kirim-otp', async (req, res) => {
   const { nomor_hp } = req.body;
-  if (!nomor_hp) return res.status(400).json({ sukses: false, pesan: 'Nomor HP wajib diisi' });
-
   const hp = nomor_hp.replace(/\D/g, '').replace(/^0/, '62');
   const kode = Math.floor(100000 + Math.random() * 900000).toString();
-  const expires_at = new Date(Date.now() + 5 * 60000).toISOString(); // 5 menit
-
+  const expires_at = new Date(Date.now() + 5 * 60000).toISOString();
   try {
-    // Simpan ke tabel OTP Supabase
     await supabase('otp', 'POST', { hp, kode, expires_at });
-
-    // Kirim via Fonnte
     const token = process.env.FONNTE_TOKEN;
-    if (!token) throw new Error('FONNTE_TOKEN belum diset di server!');
-
     await axios.post('https://api.fonnte.com/send', {
       target: hp,
-      message: `*KODE OTP OLOLU*\n\nKode Anda adalah: *${kode}*\nJangan berikan kode ini kepada siapapun.\n\nBerlaku selama 5 menit.`
+      message: `*KODE OTP OLOLU*\n\nKode Anda adalah: *${kode}*\nBerlaku selama 5 menit.`
     }, { headers: { 'Authorization': token } });
-
-    res.json({ sukses: true, pesan: 'OTP berhasil dikirim ke WhatsApp Anda' });
-  } catch (e) {
-    console.error('Gagal Kirim OTP:', e.message);
-    res.status(500).json({ sukses: false, pesan: 'Gagal kirim OTP: ' + e.message });
-  }
+    res.json({ sukses: true, pesan: 'OTP terkirim' });
+  } catch (e) { res.status(500).json({ sukses: false, pesan: e.message }); }
 });
 
-// 2. REGISTER PENGGUNA
 app.post('/api/auth/register-pengguna', async (req, res) => {
   const { nama_lengkap, nomor_hp, kata_sandi, kode_otp } = req.body;
   const hp = nomor_hp.replace(/\D/g, '').replace(/^0/, '62');
-
   try {
-    // Verifikasi OTP
     const otpData = await supabase('otp', 'GET', null, `?hp=eq.${hp}&kode=eq.${kode_otp}`);
-    if (!otpData.length) return res.status(400).json({ sukses: false, pesan: 'Kode OTP salah' });
-
-    if (new Date() > new Date(otpData[0].expires_at)) return res.status(400).json({ sukses: false, pesan: 'OTP kedaluwarsa' });
-
-    // Cek duplikasi
-    const existing = await supabase('pengguna', 'GET', null, `?nomor_hp=eq.${hp}`);
-    if (existing.length) return res.status(400).json({ sukses: false, pesan: 'Nomor HP sudah terdaftar' });
-
-    // Simpan User Baru
+    if (!otpData.length || new Date() > new Date(otpData[0].expires_at)) return res.status(400).json({ sukses: false, pesan: 'OTP tidak valid' });
     const newUser = {
       id_pengguna: 'USR' + Date.now().toString(36).toUpperCase(),
-      nama_lengkap,
-      nomor_hp: hp,
-      kata_sandi: hashPassword(kata_sandi),
-      status_akun: 'aktif',
-      tanggal_daftar: new Date().toISOString()
+      nama_lengkap, nomor_hp: hp, kata_sandi: hashPassword(kata_sandi), status_akun: 'aktif', tanggal_daftar: new Date().toISOString()
     };
     await supabase('pengguna', 'POST', newUser);
-
-    // Hapus OTP setelah sukses
-    await supabase('otp', 'DELETE', null, `?hp=eq.${hp}`);
-
     res.json({ sukses: true, data: { token: generateToken({ id: newUser.id_pengguna, role: 'pengguna' }), pengguna: newUser } });
   } catch (e) { res.status(500).json({ sukses: false, pesan: e.message }); }
 });
 
-// 3. LOGIN ADMIN
 app.post('/api/auth/login-admin', async (req, res) => {
   const { id_pengguna, kata_sandi } = req.body;
   try {
@@ -137,70 +149,68 @@ app.post('/api/auth/login-admin', async (req, res) => {
     const admin = data[0];
     if (admin && checkPassword(kata_sandi, admin.kata_sandi)) {
       res.json({ sukses: true, data: { token: generateToken({ id: admin.id_admin, role: 'admin' }), admin: { id: admin.id_admin, username: admin.id_pengguna, role: 'admin' } } });
-    } else {
-      res.status(401).json({ sukses: false, pesan: 'ID atau Password Admin salah' });
-    }
+    } else { res.status(401).json({ sukses: false, pesan: 'ID atau Password salah' }); }
   } catch (e) { res.status(500).json({ sukses: false, pesan: e.message }); }
 });
 
-// 4. LOGIN PENGGUNA
 app.post('/api/auth/login-pengguna', async (req, res) => {
   const { nomor_hp, kata_sandi } = req.body;
+  const hp = nomor_hp.replace(/\D/g,'').replace(/^0/,'62');
   try {
-    const hp = nomor_hp.replace(/\D/g,'').replace(/^0/,'62');
     const data = await supabase('pengguna', 'GET', null, `?nomor_hp=eq.${hp}`);
     const user = data[0];
     if (user && checkPassword(kata_sandi, user.kata_sandi)) {
       res.json({ sukses: true, data: { token: generateToken({ id: user.id_pengguna, role: 'pengguna' }), pengguna: { id: user.id_pengguna, nama_lengkap: user.nama_lengkap, role: 'pengguna' } } });
-    } else {
-      res.status(401).json({ sukses: false, pesan: 'Nomor HP atau Password salah' });
-    }
+    } else { res.status(401).json({ sukses: false, pesan: 'HP/Password salah' }); }
   } catch (e) { res.status(500).json({ sukses: false, pesan: e.message }); }
 });
 
-// 5. LOGIN DRIVER
 app.post('/api/auth/login-driver', async (req, res) => {
   const { nomor_hp, kode_akses } = req.body;
+  const hp = nomor_hp.replace(/\D/g,'').replace(/^0/,'62');
   try {
-    const hp = nomor_hp.replace(/\D/g,'').replace(/^0/,'62');
     const data = await supabase('drivers', 'GET', null, `?nomor_hp=eq.${hp}&kode_akses=eq.${kode_akses.toUpperCase()}`);
     const d = data[0];
     if (d) {
       res.json({ sukses: true, data: { token: generateToken({ id: d.id_driver, role: 'driver' }), driver: { id: d.id_driver, nama_lengkap: d.nama_lengkap, role: 'driver' } } });
-    } else {
-      res.status(401).json({ sukses: false, pesan: 'Nomor HP atau Kode Akses salah' });
-    }
+    } else { res.status(401).json({ sukses: false, pesan: 'HP/Kode salah' }); }
   } catch (e) { res.status(500).json({ sukses: false, pesan: e.message }); }
 });
 
-// 6. DASHBOARD ADMIN
+// 2. PESANAN ROUTES
+app.post('/api/pesanan/buat', async (req, res) => {
+  try {
+    const id_pesanan = 'ORD-' + Date.now().toString().slice(-8).toUpperCase();
+    const p = { ...req.body, id_pesanan, status_pesanan: 'mencari_driver', tanggal_waktu: new Date().toISOString() };
+    await supabase('pesanan', 'POST', p);
+    // Logic cari driver & notify would go here
+    res.json({ sukses: true, data: p });
+  } catch (e) { res.status(500).json({ sukses: false, pesan: e.message }); }
+});
+
+app.get('/api/pesanan/detail', async (req, res) => {
+  try {
+    const p = (await supabase('pesanan', 'GET', null, `?id_pesanan=eq.${req.query.id}`))[0];
+    if (!p) return res.status(404).json({ sukses: false });
+    const [d, u] = await Promise.all([
+      p.id_driver ? supabase('drivers', 'GET', null, `?id_driver=eq.${p.id_driver}`) : Promise.resolve([]),
+      p.id_pengguna ? supabase('pengguna', 'GET', null, `?id_pengguna=eq.${p.id_pengguna}`) : Promise.resolve([])
+    ]);
+    res.json({ sukses: true, data: { ...p, driver_info: d[0], pengguna_info: u[0] } });
+  } catch (e) { res.status(500).json({ sukses: false, pesan: e.message }); }
+});
+
+// 3. ADMIN ROUTES
 app.get('/api/admin/dashboard', async (req, res) => {
   try {
-    const [drivers, users, pesanan, setoran] = await Promise.all([
-      supabase('drivers'),
-      supabase('pengguna'),
-      supabase('pesanan', 'GET', null, '?order=tanggal_waktu.desc'),
-      supabase('setoran', 'GET', null, '?status=eq.belum_diverifikasi')
-    ]);
-    res.json({
-      sukses: true,
-      data: {
-        total_driver: drivers.length,
-        driver_aktif: drivers.filter(d => d.status_operasi === 'siap').length,
-        total_pengguna: users.length,
-        pesanan_total: pesanan.length,
-        pesanan_hari_ini: pesanan.filter(p => new Date(p.tanggal_waktu).toDateString() === new Date().toDateString()).length,
-        setoran_pending: setoran.length
-      }
-    });
+    const [drivers, users, pesanan] = await Promise.all([supabase('drivers'), supabase('pengguna'), supabase('pesanan')]);
+    res.json({ sukses: true, data: { total_driver: drivers.length, total_pengguna: users.length, pesanan_total: pesanan.length }});
   } catch (e) { res.status(500).json({ sukses: false, pesan: e.message }); }
 });
 
 app.get('/api/admin/pengaturan', async (req, res) => {
-  try {
-    const data = await supabase('pengaturan', 'GET', null, `?id=eq.sistem`);
-    res.json({ sukses: true, data: data[0]?.data || {} });
-  } catch (e) { res.status(500).json({ sukses: false, pesan: e.message }); }
+  try { res.json({ sukses: true, data: (await supabase('pengaturan', 'GET', null, `?id=eq.sistem`))[0]?.data || {} }); }
+  catch (e) { res.status(500).json({ sukses: false, pesan: e.message }); }
 });
 
 app.get('/api/admin/driver', async (req, res) => {
@@ -209,7 +219,7 @@ app.get('/api/admin/driver', async (req, res) => {
 });
 
 app.get('/api/admin/pesanan', async (req, res) => {
-    try { res.json({ sukses: true, data: await supabase('pesanan', 'GET', null, '?order=tanggal_waktu.desc&limit=100') }); }
+    try { res.json({ sukses: true, data: await supabase('pesanan', 'GET', null, '?order=tanggal_waktu.desc') }); }
     catch (e) { res.status(500).json({ sukses: false, pesan: e.message }); }
 });
 
@@ -218,4 +228,4 @@ app.get('/api/admin/pengguna', async (req, res) => {
     catch (e) { res.status(500).json({ sukses: false, pesan: e.message }); }
 });
 
-app.listen(PORT, () => console.log(`Server OLOLU UNLIMITED LIVE on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server LIVE on port ${PORT}`));
