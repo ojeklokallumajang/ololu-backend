@@ -152,7 +152,14 @@ app.post('/api/auth/kirim-otp', async (req, res) => {
   const kode = Math.floor(100000 + Math.random() * 900000).toString();
   const expires_at = new Date(Date.now() + 5 * 60000).toISOString();
   try {
-    await supabase('otp', 'POST', { hp, kode, expires_at });
+    // FIX: Cek dulu apakah sudah ada OTP untuk nomor ini
+    const existing = await supabase('otp', 'GET', null, `?hp=eq.${hp}`);
+    if (existing.length) {
+        await supabase('otp', 'PATCH', { kode, expires_at }, `?hp=eq.${hp}`);
+    } else {
+        await supabase('otp', 'POST', { hp, kode, expires_at });
+    }
+
     await axios.post('https://api.fonnte.com/send', {
       target: hp,
       message: `*KODE OTP OLOLU*\n\nKode Anda adalah: *${kode}*\nBerlaku selama 5 menit.`
@@ -172,6 +179,8 @@ app.post('/api/auth/register-pengguna', async (req, res) => {
       nama_lengkap, nomor_hp: hp, kata_sandi: hashPassword(kata_sandi), status_akun: 'aktif', tanggal_daftar: new Date().toISOString()
     };
     await supabase('pengguna', 'POST', newUser);
+    // Hapus OTP setelah berhasil
+    await supabase('otp', 'DELETE', null, `?hp=eq.${hp}`);
     res.json({ sukses: true, data: { token: generateToken({ id: newUser.id_pengguna, role: 'pengguna' }), pengguna: newUser } });
   } catch (e) { res.status(500).json({ sukses: false, pesan: e.message }); }
 });
@@ -182,7 +191,7 @@ app.post('/api/auth/login-admin', async (req, res) => {
     const data = await supabase('admins', 'GET', null, `?id_pengguna=ilike.${id_pengguna}`);
     const admin = data[0];
     if (admin && checkPassword(kata_sandi, admin.kata_sandi)) {
-      res.json({ sukses: true, data: { token: generateToken({ id: admin.id_admin, username: admin.id_pengguna, role: 'admin' }), admin: { id: admin.id_admin, username: admin.id_pengguna, role: 'admin' } } });
+      res.json({ sukses: true, data: { token: generateToken({ id: admin.id_admin, role: 'admin' }), admin: { id: admin.id_admin, username: admin.id_pengguna, role: 'admin' } } });
     } else { res.status(401).json({ sukses: false, pesan: 'ID atau Password salah' }); }
   } catch (e) { res.status(500).json({ sukses: false, pesan: e.message }); }
 });
